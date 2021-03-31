@@ -9,7 +9,7 @@ import {
 } from './diff-helpers'
 import { ILineTokens } from '../../lib/highlighter/types'
 import classNames from 'classnames'
-import { Octicon } from '../octicons'
+import { Octicon, OcticonSymbol } from '../octicons'
 import { narrowNoNewlineSymbol } from './text-diff'
 import { shallowEquals, structuralEquals } from '../../lib/equality'
 
@@ -110,7 +110,7 @@ export class SideBySideDiffRow extends React.Component<
       case DiffRowType.Hunk:
         return (
           <div className="row hunk-info">
-            {this.renderLineNumber()}
+            {this.renderHunkExpansionHandle()}
             {this.renderContentFromString(row.content)}
           </div>
         )
@@ -254,6 +254,16 @@ export class SideBySideDiffRow extends React.Component<
             title="No newline at end of file"
           />
         )}
+      </div>
+    )
+  }
+
+  private renderHunkExpansionHandle() {
+    return (
+      <div className="hunk-expansion-handle selectable">
+        <span>
+          <Octicon symbol={OcticonSymbol.foldDown} />
+        </span>
       </div>
     )
   }
