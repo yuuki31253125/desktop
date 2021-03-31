@@ -338,6 +338,7 @@ export class TextDiff extends React.Component<ITextDiffProps, ITextDiffState> {
   /** The current, active, diff gutter selection if any */
   private selection: ISelection | null = null
 
+  /** The content lines of the "new" file */
   private newContentLines: ReadonlyArray<string> | null = null
 
   /** Whether a particular range should be highlighted due to hover */

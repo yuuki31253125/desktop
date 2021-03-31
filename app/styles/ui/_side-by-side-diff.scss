@@ -108,10 +108,11 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      padding: 4px 0;
     }
 
     &.selectable {
-      span {
+      * {
         cursor: pointer;
       }
 
@@ -210,6 +211,7 @@
     &.hunk-info {
       background: var(--diff-hunk-background-color);
       color: var(--diff-hunk-text-color);
+      align-items: center;
 
       div,
       span {

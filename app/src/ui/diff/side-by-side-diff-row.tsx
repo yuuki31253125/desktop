@@ -12,6 +12,7 @@ import classNames from 'classnames'
 import { Octicon, OcticonSymbol } from '../octicons'
 import { narrowNoNewlineSymbol } from './text-diff'
 import { shallowEquals, structuralEquals } from '../../lib/equality'
+import { DiffHunkExpansionType } from '../../models/diff'
 
 interface ISideBySideDiffRowProps {
   /**
@@ -107,13 +108,19 @@ export class SideBySideDiffRow extends React.Component<
     const { row, showSideBySideDiff } = this.props
 
     switch (row.type) {
-      case DiffRowType.Hunk:
+      case DiffRowType.Hunk: {
+        const className = ['row', 'hunk-info']
+        if (row.expansionType === DiffHunkExpansionType.Both) {
+          className.push('expandable-both')
+        }
+
         return (
-          <div className="row hunk-info">
-            {this.renderHunkExpansionHandle()}
+          <div className={classNames(className)}>
+            {this.renderHunkExpansionHandle(row.expansionType)}
             {this.renderContentFromString(row.content)}
           </div>
         )
+      }
       case DiffRowType.Context:
         const { beforeLineNumber, afterLineNumber } = row
         if (!showSideBySideDiff) {
@@ -258,12 +265,42 @@ export class SideBySideDiffRow extends React.Component<
     )
   }
 
-  private renderHunkExpansionHandle() {
+  private getHunkExpansionIcon(expansionType: DiffHunkExpansionType) {
+    switch (expansionType) {
+      case DiffHunkExpansionType.Up:
+        return OcticonSymbol.foldUp
+      case DiffHunkExpansionType.Down:
+        return OcticonSymbol.foldDown
+      case DiffHunkExpansionType.Short:
+        return OcticonSymbol.fold
+    }
+
+    return null
+  }
+
+  private renderHunkExpansionHandle(expansionType: DiffHunkExpansionType) {
+    if (expansionType === DiffHunkExpansionType.Both) {
+      return (
+        <div>
+          <div className="hunk-expansion-handle selectable hunk-expansion-handle-up">
+            <span>
+              <Octicon symbol={OcticonSymbol.foldUp} />
+            </span>
+          </div>
+          <div className="hunk-expansion-handle selectable hunk-expansion-handle-down">
+            <span>
+              <Octicon symbol={OcticonSymbol.foldDown} />
+            </span>
+          </div>
+        </div>
+      )
+    }
+
+    const icon = this.getHunkExpansionIcon(expansionType)
+
     return (
       <div className="hunk-expansion-handle selectable">
-        <span>
-          <Octicon symbol={OcticonSymbol.foldDown} />
-        </span>
+        <span>{icon && <Octicon symbol={icon} />}</span>
       </div>
     )
   }
