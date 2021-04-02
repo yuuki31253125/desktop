@@ -18,27 +18,19 @@ import {
   ICommitSelection,
   IRebaseState,
   ChangesSelectionKind,
+  ICherryPickState,
 } from '../app-state'
-import { ComparisonCache } from '../comparison-cache'
-import { IGitHubUser } from '../databases'
 import { merge } from '../merge'
 import { DefaultCommitMessage } from '../../models/commit-message'
 
 export class RepositoryStateCache {
   private readonly repositoryState = new Map<string, IRepositoryState>()
 
-  public constructor(
-    private readonly getUsersForRepository: (
-      repository: Repository
-    ) => Map<string, IGitHubUser>
-  ) {}
-
   /** Get the state for the repository. */
   public get(repository: Repository): IRepositoryState {
     const existing = this.repositoryState.get(repository.hash)
     if (existing != null) {
-      const gitHubUsers = this.getUsersForRepository(repository)
-      return merge(existing, { gitHubUsers })
+      return existing
     }
 
     const newItem = getInitialRepositoryState()
@@ -110,12 +102,23 @@ export class RepositoryStateCache {
       return { rebaseState: newState }
     })
   }
+
+  public updateCherryPickState<K extends keyof ICherryPickState>(
+    repository: Repository,
+    fn: (state: ICherryPickState) => Pick<ICherryPickState, K>
+  ) {
+    this.update(repository, state => {
+      const { cherryPickState } = state
+      const newState = merge(cherryPickState, fn(cherryPickState))
+      return { cherryPickState: newState }
+    })
+  }
 }
 
 function getInitialRepositoryState(): IRepositoryState {
   return {
     commitSelection: {
-      sha: null,
+      shas: [],
       file: null,
       changedFiles: new Array<CommittedFileChange>(),
       diff: null,
@@ -148,11 +151,6 @@ function getInitialRepositoryState(): IRepositoryState {
       rebasedBranches: new Map<string, string>(),
     },
     compareState: {
-      divergingBranchBannerState: {
-        isPromptVisible: false,
-        isPromptDismissed: false,
-        isNudgeVisible: false,
-      },
       formState: {
         kind: HistoryTabMode.History,
       },
@@ -161,11 +159,9 @@ function getInitialRepositoryState(): IRepositoryState {
       showBranchList: false,
       filterText: '',
       commitSHAs: [],
-      aheadBehindCache: new ComparisonCache(),
-      allBranches: new Array<Branch>(),
+      branches: new Array<Branch>(),
       recentBranches: new Array<Branch>(),
       defaultBranch: null,
-      inferredComparisonBranch: { branch: null, aheadBehind: null },
     },
     rebaseState: {
       step: null,
@@ -174,7 +170,6 @@ function getInitialRepositoryState(): IRepositoryState {
       userHasResolvedConflicts: false,
     },
     commitAuthor: null,
-    gitHubUsers: new Map<string, IGitHubUser>(),
     commitLookup: new Map<string, Commit>(),
     localCommitSHAs: [],
     localTags: null,
@@ -187,5 +182,12 @@ function getInitialRepositoryState(): IRepositoryState {
     checkoutProgress: null,
     pushPullFetchProgress: null,
     revertProgress: null,
+    cherryPickState: {
+      step: null,
+      progress: null,
+      userHasResolvedConflicts: false,
+      targetBranchUndoSha: null,
+      branchCreated: false,
+    },
   }
 }

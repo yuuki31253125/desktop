@@ -6,13 +6,10 @@ import {
   DialogFooter,
   DefaultDialogFooter,
 } from './dialog'
-import {
-  dialogTransitionEnterTimeout,
-  dialogTransitionLeaveTimeout,
-} from './app'
+import { dialogTransitionTimeout } from './app'
 import { GitError, isAuthFailureError } from '../lib/git/core'
 import { Popup, PopupType } from '../models/popup'
-import { CSSTransitionGroup } from 'react-transition-group'
+import { TransitionGroup, CSSTransition } from 'react-transition-group'
 import { OkCancelButtonGroup } from './dialog/ok-cancel-button-group'
 import { ErrorWithMetadata } from '../lib/error-with-metadata'
 import { RetryActionType, RetryAction } from '../models/retry-actions'
@@ -82,7 +79,7 @@ export class AppError extends React.Component<IAppErrorProps, IAppErrorState> {
       // with the next error in the queue.
       window.setTimeout(() => {
         this.props.onClearError(currentError)
-      }, dialogTransitionLeaveTimeout)
+      }, dialogTransitionTimeout.exit)
     }
   }
 
@@ -93,7 +90,7 @@ export class AppError extends React.Component<IAppErrorProps, IAppErrorState> {
     //being open at the same time.
     window.setTimeout(() => {
       this.props.onShowPopup({ type: PopupType.Preferences })
-    }, dialogTransitionLeaveTimeout)
+    }, dialogTransitionTimeout.exit)
   }
 
   private onRetryAction = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -111,16 +108,13 @@ export class AppError extends React.Component<IAppErrorProps, IAppErrorState> {
   }
 
   private renderErrorMessage(error: Error) {
-    const e = error instanceof ErrorWithMetadata ? error.underlyingError : error
+    const e = getUnderlyingError(error)
 
-    if (e instanceof GitError) {
-      // See getResultMessage in core.ts
-      // If the error message is the same as stderr or stdout then we know
-      // it's output from git and we'll display it in fixed-width font
-      if (e.message === e.result.stderr || e.message === e.result.stdout) {
-        const formattedMessage = this.formatGitErrorMessage(e.message)
-        return <p className="monospace">{formattedMessage}</p>
-      }
+    // If the error message is just the raw git output, display it in
+    // fixed-width font
+    if (isRawGitError(e)) {
+      const formattedMessage = this.formatGitErrorMessage(e.message)
+      return <p className="monospace">{formattedMessage}</p>
     }
 
     return <p>{e.message}</p>
@@ -151,6 +145,9 @@ export class AppError extends React.Component<IAppErrorProps, IAppErrorState> {
         onSubmit={this.onDismissed}
         onDismissed={this.onDismissed}
         disabled={this.state.disabled}
+        className={
+          isRawGitError(this.state.error) ? 'raw-git-error' : undefined
+        }
       >
         <DialogContent onRef={this.onDialogContentRef}>
           {this.renderErrorMessage(error)}
@@ -190,10 +187,8 @@ export class AppError extends React.Component<IAppErrorProps, IAppErrorState> {
 
     const e = getUnderlyingError(this.state.error)
 
-    if (isGitError(e)) {
-      if (e.message === e.result.stderr || e.message === e.result.stdout) {
-        this.dialogContent.scrollTop = this.dialogContent.scrollHeight
-      }
+    if (isRawGitError(e)) {
+      this.dialogContent.scrollTop = this.dialogContent.scrollHeight
     }
   }
 
@@ -262,15 +257,16 @@ export class AppError extends React.Component<IAppErrorProps, IAppErrorState> {
   }
 
   public render() {
+    const dialogContent = this.renderDialog()
+
     return (
-      <CSSTransitionGroup
-        transitionName="modal"
-        component="div"
-        transitionEnterTimeout={dialogTransitionEnterTimeout}
-        transitionLeaveTimeout={dialogTransitionLeaveTimeout}
-      >
-        {this.renderDialog()}
-      </CSSTransitionGroup>
+      <TransitionGroup>
+        {dialogContent && (
+          <CSSTransition classNames="modal" timeout={dialogTransitionTimeout}>
+            {dialogContent}
+          </CSSTransition>
+        )}
+      </TransitionGroup>
     )
   }
 }
@@ -285,6 +281,14 @@ function isErrorWithMetaData(error: Error): error is ErrorWithMetadata {
 
 function isGitError(error: Error): error is GitError {
   return error instanceof GitError
+}
+
+function isRawGitError(error: Error | null) {
+  if (!error) {
+    return false
+  }
+  const e = getUnderlyingError(error)
+  return e instanceof GitError && e.isRawMessage
 }
 
 function isCloneError(error: Error) {

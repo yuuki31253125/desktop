@@ -3,6 +3,7 @@ import {
   GitError,
   IGitExecutionOptions,
   gitNetworkArguments,
+  gitRebaseArguments,
 } from './core'
 import { Repository } from '../../models/repository'
 import { IPullProgress } from '../../models/progress'
@@ -11,7 +12,8 @@ import { PullProgressParser, executionOptionsWithProgress } from '../progress'
 import { AuthenticationErrors } from './authentication'
 import { enableRecurseSubmodulesFlag } from '../feature-flag'
 import { IRemote } from '../../models/remote'
-import { envForRemoteOperation } from './environment'
+import { merge } from '../merge'
+import { withTrampolineEnvForRemoteOperation } from '../trampoline/trampoline-environment'
 
 async function getPullArgs(
   repository: Repository,
@@ -21,7 +23,7 @@ async function getPullArgs(
 ) {
   const networkArguments = await gitNetworkArguments(repository, account)
 
-  const args = [...networkArguments, 'pull']
+  const args = [...networkArguments, ...gitRebaseArguments(), 'pull']
 
   if (enableRecurseSubmodulesFlag()) {
     args.push('--recurse-submodules')
@@ -56,7 +58,6 @@ export async function pull(
   progressCallback?: (progress: IPullProgress) => void
 ): Promise<void> {
   let opts: IGitExecutionOptions = {
-    env: await envForRemoteOperation(account, remote.url),
     expectedErrors: AuthenticationErrors,
   }
 
@@ -103,7 +104,16 @@ export async function pull(
     account,
     progressCallback
   )
-  const result = await git(args, repository.path, 'pull', opts)
+  const result = await withTrampolineEnvForRemoteOperation(
+    account,
+    remote.url,
+    env => {
+      return git(args, repository.path, 'pull', {
+        ...opts,
+        env: merge(opts.env, env),
+      })
+    }
+  )
 
   if (result.gitErrorDescription) {
     throw new GitError(result, args)

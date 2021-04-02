@@ -1,8 +1,11 @@
 import { remote } from 'electron'
 import { Disposable, IDisposable } from 'event-kit'
-import * as Path from 'path'
 
-import { IAPIOrganization, IAPIRefStatus, IAPIRepository } from '../../lib/api'
+import {
+  IAPIOrganization,
+  IAPIPullRequest,
+  IAPIFullRepository,
+} from '../../lib/api'
 import { shell } from '../../lib/app-shell'
 import {
   CompareAction,
@@ -10,10 +13,11 @@ import {
   FoldoutType,
   ICompareFormUpdate,
   RepositorySectionTab,
-  isMergeConflictState,
   RebaseConflictState,
+  isRebaseConflictState,
+  isCherryPickConflictState,
+  CherryPickConflictState,
 } from '../../lib/app-state'
-import { ExternalEditor } from '../../lib/editors'
 import { assertNever, fatalError } from '../../lib/fatal-error'
 import {
   setGenericPassword,
@@ -23,7 +27,7 @@ import {
   isGitRepository,
   RebaseResult,
   PushOptions,
-  getCommitsInRange,
+  getCommitsBetweenCommits,
   getBranches,
 } from '../../lib/git'
 import { isGitOnPath } from '../../lib/is-git-on-path'
@@ -39,7 +43,6 @@ import {
 } from '../../lib/parse-app-url'
 import {
   matchExistingRepository,
-  urlMatchesCloneURL,
   urlsMatch,
 } from '../../lib/repository-matching'
 import { Shell } from '../../lib/shells'
@@ -71,6 +74,7 @@ import {
   isRepositoryWithGitHubRepository,
   getGitHubHtmlUrl,
   isRepositoryWithForkedGitHubRepository,
+  getNonForkGitHubRepository,
 } from '../../models/repository'
 import { RetryAction, RetryActionType } from '../../models/retry-actions'
 import {
@@ -87,16 +91,24 @@ import { executeMenuItem } from '../main-process-proxy'
 import {
   CommitStatusStore,
   StatusCallBack,
+  ICombinedRefCheck,
 } from '../../lib/stores/commit-status-store'
-import { MergeResult } from '../../models/merge'
-import {
-  UncommittedChangesStrategy,
-  UncommittedChangesStrategyKind,
-} from '../../models/uncommitted-changes-strategy'
+import { MergeTreeResult } from '../../models/merge'
+import { UncommittedChangesStrategy } from '../../models/uncommitted-changes-strategy'
 import { RebaseFlowStep, RebaseStep } from '../../models/rebase-flow-step'
 import { IStashEntry } from '../../models/stash-entry'
 import { WorkflowPreferences } from '../../models/workflow-preferences'
 import { enableForkSettings } from '../../lib/feature-flag'
+import { resolveWithin } from '../../lib/path'
+import {
+  CherryPickFlowStep,
+  CherryPickStepKind,
+  CreateBranchStep,
+} from '../../models/cherry-pick'
+import { CherryPickResult } from '../../lib/git/cherry-pick'
+import { sleep } from '../../lib/promise'
+import { DragElement } from '../../models/drag-element'
+import { findDefaultUpstreamBranch } from '../../lib/branch'
 
 /**
  * An error handler function.
@@ -152,7 +164,7 @@ export class Dispatcher {
   public addTutorialRepository(
     path: string,
     endpoint: string,
-    apiRepository: IAPIRepository
+    apiRepository: IAPIFullRepository
   ) {
     return this.appStore._addTutorialRepository(path, endpoint, apiRepository)
   }
@@ -167,18 +179,18 @@ export class Dispatcher {
     return this.appStore._pauseTutorial(repository)
   }
 
-  /** Remove the repositories represented by the given IDs from local storage. */
-  public removeRepositories(
-    repositories: ReadonlyArray<Repository | CloningRepository>,
+  /**
+   * Remove the repositories represented by the given IDs from local storage.
+   *
+   * When `moveToTrash` is enabled, only the repositories that were successfully
+   * deleted on disk are removed from the app. If some failed due to files being
+   * open elsewhere, an error is thrown.
+   */
+  public async removeRepository(
+    repository: Repository | CloningRepository,
     moveToTrash: boolean
   ): Promise<void> {
-    if (moveToTrash) {
-      repositories.forEach(repository => {
-        shell.moveItemToTrash(repository.path)
-      })
-    }
-
-    return this.appStore._removeRepositories(repositories)
+    return this.appStore._removeRepository(repository, moveToTrash)
   }
 
   /** Update the repository's `missing` flag. */
@@ -212,9 +224,9 @@ export class Dispatcher {
    */
   public changeCommitSelection(
     repository: Repository,
-    sha: string
+    shas: ReadonlyArray<string>
   ): Promise<void> {
-    return this.appStore._changeCommitSelection(repository, sha)
+    return this.appStore._changeCommitSelection(repository, shas)
   }
 
   /**
@@ -331,6 +343,14 @@ export class Dispatcher {
     return this.appStore._refreshOrRecoverRepository(repository)
   }
 
+  /**
+   * Refresh the commit author of a repository. Required after changing git's
+   * user name or email address.
+   */
+  public async refreshAuthor(repository: Repository): Promise<void> {
+    return this.appStore._refreshAuthor(repository)
+  }
+
   /** Show the popup. This will close any current popup. */
   public showPopup(popup: Popup): Promise<void> {
     return this.appStore._showPopup(popup)
@@ -381,7 +401,7 @@ export class Dispatcher {
     }
 
     // and the remote branch has commits that don't exist on the base branch
-    const remoteCommits = await getCommitsInRange(
+    const remoteCommits = await getCommitsBetweenCommits(
       repository,
       baseBranch.tip.sha,
       targetBranch.upstream
@@ -400,10 +420,10 @@ export class Dispatcher {
   ): Promise<void> {
     const { askForConfirmationOnForcePush } = this.appStore.getState()
 
-    const hasOverridenForcePushCheck =
+    const hasOverriddenForcePushCheck =
       options !== undefined && options.continueWithForcePush
 
-    if (askForConfirmationOnForcePush && !hasOverridenForcePushCheck) {
+    if (askForConfirmationOnForcePush && !hasOverriddenForcePushCheck) {
       const showWarning = await this.warnAboutRemoteCommits(
         repository,
         baseBranch,
@@ -442,7 +462,7 @@ export class Dispatcher {
     const repositoryState = this.repositoryStateManager.get(repository)
     const { conflictState } = repositoryState.changesState
 
-    if (conflictState === null || conflictState.kind === 'merge') {
+    if (conflictState === null || !isRebaseConflictState(conflictState)) {
       return
     }
 
@@ -479,14 +499,12 @@ export class Dispatcher {
     repository: Repository,
     name: string,
     startPoint: string | null,
-    uncommittedChangesStrategy?: UncommittedChangesStrategy,
     noTrackOption: boolean = false
-  ): Promise<Repository> {
+  ): Promise<Branch | undefined> {
     return this.appStore._createBranch(
       repository,
       name,
       startPoint,
-      uncommittedChangesStrategy,
       noTrackOption
     )
   }
@@ -545,13 +563,9 @@ export class Dispatcher {
   public checkoutBranch(
     repository: Repository,
     branch: Branch,
-    uncommittedChangesStrategy?: UncommittedChangesStrategy
+    strategy?: UncommittedChangesStrategy
   ): Promise<Repository> {
-    return this.appStore._checkoutBranch(
-      repository,
-      branch,
-      uncommittedChangesStrategy
-    )
+    return this.appStore._checkoutBranch(repository, branch, strategy)
   }
 
   /** Push the current branch. */
@@ -652,7 +666,7 @@ export class Dispatcher {
   public async clone(
     url: string,
     path: string,
-    options?: { branch?: string }
+    options?: { branch?: string; defaultBranch?: string }
   ): Promise<Repository | null> {
     return this.appStore._completeOpenInDesktop(async () => {
       const { promise, repository } = this.appStore._clone(url, path, options)
@@ -692,14 +706,24 @@ export class Dispatcher {
 
   /**
    * Delete the branch. This will delete both the local branch and the remote
-   * branch, and then check out the default branch.
+   * branch if includeUpstream is true, and then check out the default branch.
    */
-  public deleteBranch(
+  public deleteLocalBranch(
     repository: Repository,
     branch: Branch,
-    includeRemote: boolean
+    includeUpstream?: boolean
   ): Promise<void> {
-    return this.appStore._deleteBranch(repository, branch, includeRemote)
+    return this.appStore._deleteBranch(repository, branch, includeUpstream)
+  }
+
+  /**
+   * Delete the remote branch.
+   */
+  public deleteRemoteBranch(
+    repository: Repository,
+    branch: Branch
+  ): Promise<void> {
+    return this.appStore._deleteBranch(repository, branch)
   }
 
   /** Discard the changes to the given files. */
@@ -767,27 +791,6 @@ export class Dispatcher {
    */
   public clearBanner(bannerType?: BannerType) {
     return this.appStore._clearBanner(bannerType)
-  }
-
-  /**
-   * Set the divering branch notification nudge's visibility
-   */
-  public setDivergingBranchNudgeVisibility(
-    repository: Repository,
-    isVisible: boolean
-  ) {
-    return this.appStore._updateDivergingBranchBannerState(repository, {
-      isNudgeVisible: isVisible,
-    })
-  }
-
-  /**
-   * Hide the divering branch notification banner
-   */
-  public dismissDivergingBranchBanner(repository: Repository) {
-    return this.appStore._updateDivergingBranchBannerState(repository, {
-      isPromptDismissed: true,
-    })
   }
 
   /**
@@ -890,7 +893,7 @@ export class Dispatcher {
   public mergeBranch(
     repository: Repository,
     branch: string,
-    mergeStatus: MergeResult | null
+    mergeStatus: MergeTreeResult | null
   ): Promise<void> {
     return this.appStore._mergeBranch(repository, branch, mergeStatus)
   }
@@ -1017,9 +1020,7 @@ export class Dispatcher {
     const afterSha = getTipSha(tip)
 
     log.info(
-      `[rebase] completed rebase - got ${result} and on tip ${afterSha} - kind ${
-        tip.kind
-      }`
+      `[rebase] completed rebase - got ${result} and on tip ${afterSha} - kind ${tip.kind}`
     )
 
     if (result === RebaseResult.ConflictsEncountered) {
@@ -1031,9 +1032,9 @@ export class Dispatcher {
         return
       }
 
-      if (isMergeConflictState(conflictState)) {
+      if (!isRebaseConflictState(conflictState)) {
         log.warn(
-          `[rebase] conflict state after rebase is merge conflicts - unable to continue`
+          `[rebase] conflict state after rebase is not rebase conflicts - unable to continue`
         )
         return
       }
@@ -1048,9 +1049,7 @@ export class Dispatcher {
     } else if (result === RebaseResult.CompletedWithoutError) {
       if (tip.kind !== TipState.Valid) {
         log.warn(
-          `[rebase] tip after completing rebase is ${
-            tip.kind
-          } but this should be a valid tip if the rebase completed without error`
+          `[rebase] tip after completing rebase is ${tip.kind} but this should be a valid tip if the rebase completed without error`
         )
         return
       }
@@ -1082,7 +1081,7 @@ export class Dispatcher {
   }
 
   /**
-   * Continue with the rebase after the user has resovled all conflicts with
+   * Continue with the rebase after the user has resolved all conflicts with
    * tracked files in the working directory.
    */
   public async continueRebase(
@@ -1114,9 +1113,7 @@ export class Dispatcher {
     const afterSha = getTipSha(tip)
 
     log.info(
-      `[continueRebase] completed rebase - got ${result} and on tip ${afterSha} - kind ${
-        tip.kind
-      }`
+      `[continueRebase] completed rebase - got ${result} and on tip ${afterSha} - kind ${tip.kind}`
     )
 
     if (result === RebaseResult.ConflictsEncountered) {
@@ -1128,9 +1125,9 @@ export class Dispatcher {
         return
       }
 
-      if (isMergeConflictState(conflictState)) {
+      if (!isRebaseConflictState(conflictState)) {
         log.warn(
-          `[continueRebase] conflict state after rebase is merge conflicts - unable to continue`
+          `[continueRebase] conflict state after rebase is not rebase conflicts - unable to continue`
         )
         return
       }
@@ -1146,9 +1143,7 @@ export class Dispatcher {
     } else if (result === RebaseResult.CompletedWithoutError) {
       if (tip.kind !== TipState.Valid) {
         log.warn(
-          `[continueRebase] tip after completing rebase is ${
-            tip.kind
-          } but this should be a valid tip if the rebase completed without error`
+          `[continueRebase] tip after completing rebase is ${tip.kind} but this should be a valid tip if the rebase completed without error`
         )
         return
       }
@@ -1310,8 +1305,8 @@ export class Dispatcher {
     return this.appStore.setStatsOptOut(optOut, userViewedPrompt)
   }
 
-  public markUsageStatsNoteSeen() {
-    this.appStore.markUsageStatsNoteSeen()
+  public moveToApplicationsFolder() {
+    remote.app.moveToApplicationsFolder?.()
   }
 
   /**
@@ -1445,7 +1440,7 @@ export class Dispatcher {
   public async showCreateForkDialog(
     repository: RepositoryWithGitHubRepository
   ): Promise<void> {
-    await this.appStore._showCreateforkDialog(repository)
+    await this.appStore._showCreateForkDialog(repository)
   }
 
   /**
@@ -1485,7 +1480,7 @@ export class Dispatcher {
   /**
    * Change the workflow preferences for the specified repository.
    *
-   * @param repository            The repositosy to update.
+   * @param repository            The repository to update.
    * @param workflowPreferences   The object with the workflow settings to use.
    */
   public async updateRepositoryWorkflowPreferences(
@@ -1516,99 +1511,171 @@ export class Dispatcher {
     }
   }
 
-  private async getForkAndUpstreamRepos(url: string) {
+  /**
+   * Find an existing repository that can be used for checking out
+   * the passed pull request.
+   *
+   * This method will try to find an opened repository that matches the
+   * HEAD repository of the PR first and if not found it will try to
+   * find an opened repository that matches the BASE repository of the PR.
+   * Matching in this context means that either the origin remote or the
+   * upstream remote url are equal to the PR ref repository URL.
+   *
+   * With this logic we try to select the best suited repository to open
+   * a PR when triggering a "Open PR from Desktop" action from a browser.
+   *
+   * @param pullRequest the pull request object received from the API.
+   */
+  private getRepositoryFromPullRequest(
+    pullRequest: IAPIPullRequest
+  ): RepositoryWithGitHubRepository | null {
     const state = this.appStore.getState()
     const repositories = state.repositories
+    const headUrl = pullRequest.head.repo?.clone_url
+    const baseUrl = pullRequest.base.repo?.clone_url
 
-    const forks: Array<Repository> = []
-    const upstreams: Array<Repository> = []
+    // This likely means that the base repository has been deleted
+    // and we don't support checking out from refs/pulls/NNN/head
+    // yet so we'll bail for now.
+    if (headUrl === undefined || baseUrl === undefined) {
+      return null
+    }
 
-    for (const repo of repositories) {
-      // ensure that repo is not an instance of CloningRepository
-      if (
-        repo instanceof Repository &&
-        isRepositoryWithGitHubRepository(repo)
-      ) {
-        const defaultUrl = repo.gitHubRepository.htmlURL
-        const upstreamUrl =
-          repo.gitHubRepository.parent && repo.gitHubRepository.parent.htmlURL
-        if (defaultUrl && urlsMatch(defaultUrl, url)) {
-          upstreams.push(repo)
-        } else if (upstreamUrl && urlsMatch(upstreamUrl, url)) {
-          forks.push(repo)
-        }
+    for (const repository of repositories) {
+      if (this.doesRepositoryMatchUrl(repository, headUrl)) {
+        return repository
       }
     }
 
-    return { forks, upstreams }
+    for (const repository of repositories) {
+      if (this.doesRepositoryMatchUrl(repository, baseUrl)) {
+        return repository
+      }
+    }
+
+    return null
+  }
+
+  private doesRepositoryMatchUrl(
+    repo: Repository | CloningRepository,
+    url: string
+  ): repo is RepositoryWithGitHubRepository {
+    if (repo instanceof Repository && isRepositoryWithGitHubRepository(repo)) {
+      const originRepoUrl = repo.gitHubRepository.htmlURL
+      const upstreamRepoUrl = repo.gitHubRepository.parent?.htmlURL ?? null
+
+      if (originRepoUrl !== null && urlsMatch(originRepoUrl, url)) {
+        return true
+      }
+
+      if (upstreamRepoUrl !== null && urlsMatch(upstreamRepoUrl, url)) {
+        return true
+      }
+    }
+
+    return false
   }
 
   private async openRepositoryFromUrl(action: IOpenRepositoryFromURLAction) {
-    const { url, pr } = action
-    const pullRequest = pr
-      ? await this.appStore.fetchPullRequest(url, pr)
-      : null
-    const sourceUrl =
-      pullRequest && pullRequest.head.repo && pullRequest.head.repo.html_url
+    const { url, pr, branch, filepath } = action
 
-    const { forks, upstreams } = await this.getForkAndUpstreamRepos(url)
+    let repository: Repository | null
 
-    // If source is in Desktop as a fork, open fork and checkout PR branch
-    const forkMatch = forks.find(fork => {
-      return Boolean(
-        fork.gitHubRepository &&
-          fork.gitHubRepository.htmlURL &&
-          sourceUrl &&
-          urlsMatch(fork.gitHubRepository.htmlURL, sourceUrl)
-      )
-    })
-
-    if (forkMatch) {
-      await this.selectRepository(forkMatch)
-      const branch = pullRequest && pullRequest.head.ref
-      if (branch) {
-        await this.checkoutLocalBranch(forkMatch, branch)
-      }
-      return
-    }
-
-    // If source is in Desktop as an upstream, open upstream and checkout PR branch
-    const upstreamMatch = upstreams.find(upstream => {
-      return Boolean(
-        upstream.gitHubRepository &&
-          upstream.gitHubRepository.htmlURL &&
-          sourceUrl &&
-          urlsMatch(upstream.gitHubRepository.htmlURL, sourceUrl)
-      )
-    })
-
-    if (upstreamMatch) {
-      await this.selectRepository(upstreamMatch)
-      await this.handleCloneInDesktopOptions(upstreamMatch, action)
-      return
-    }
-
-    // If you only have your fork in Desktop, open your fork.
-    // Checkout branch based on PR source -- `handleCloneInDesktopOptions`
-    // handles cases when source is upstream or someone else's fork
-    if (forks.length > 0 && upstreams.length === 0) {
-      const fork = forks[0]
-      await this.selectRepository(fork)
-      await this.handleCloneInDesktopOptions(fork, action) // double check that refspec fetch works correctly
-      return
-    }
-
-    // Otherwise back to default case
-    const repository = await this.openOrCloneRepository(url)
-    if (repository) {
-      await this.handleCloneInDesktopOptions(repository, action)
+    if (pr !== null) {
+      repository = await this.openPullRequestFromUrl(url, pr)
+    } else if (branch !== null) {
+      repository = await this.openBranchNameFromUrl(url, branch)
     } else {
-      log.warn(
-        `Open Repository from URL failed, did not find or clone repository: ${url} - payload: ${JSON.stringify(
-          action
-        )}`
-      )
+      repository = await this.openOrCloneRepository(url)
     }
+
+    if (repository === null) {
+      return
+    }
+
+    if (filepath !== null) {
+      const resolved = await resolveWithin(repository.path, filepath)
+
+      if (resolved !== null) {
+        shell.showItemInFolder(resolved)
+      } else {
+        log.error(
+          `Prevented attempt to open path outside of the repository root: ${filepath}`
+        )
+      }
+    }
+  }
+
+  private async openBranchNameFromUrl(
+    url: string,
+    branchName: string
+  ): Promise<Repository | null> {
+    const repository = await this.openOrCloneRepository(url)
+
+    if (repository === null) {
+      return null
+    }
+
+    // ensure a fresh clone repository has it's in-memory state
+    // up-to-date before performing the "Clone in Desktop" steps
+    await this.appStore._refreshRepository(repository)
+
+    await this.checkoutLocalBranch(repository, branchName)
+
+    return repository
+  }
+
+  private async openPullRequestFromUrl(
+    url: string,
+    pr: string
+  ): Promise<RepositoryWithGitHubRepository | null> {
+    const pullRequest = await this.appStore.fetchPullRequest(url, pr)
+
+    if (pullRequest === null) {
+      return null
+    }
+
+    // Find the repository where the PR is created in Desktop.
+    let repository: Repository | null = this.getRepositoryFromPullRequest(
+      pullRequest
+    )
+
+    if (repository !== null) {
+      await this.selectRepository(repository)
+    } else {
+      repository = await this.openOrCloneRepository(url)
+    }
+
+    if (repository === null) {
+      log.warn(
+        `Open Repository from URL failed, did not find or clone repository: ${url}`
+      )
+      return null
+    }
+    if (!isRepositoryWithGitHubRepository(repository)) {
+      log.warn(
+        `Received a non-GitHub repository when opening repository from URL: ${url}`
+      )
+      return null
+    }
+
+    // ensure a fresh clone repository has it's in-memory state
+    // up-to-date before performing the "Clone in Desktop" steps
+    await this.appStore._refreshRepository(repository)
+
+    if (pullRequest.head.repo === null) {
+      return null
+    }
+
+    await this.appStore._checkoutPullRequest(
+      repository,
+      pullRequest.number,
+      pullRequest.head.repo.owner.login,
+      pullRequest.head.repo.clone_url,
+      pullRequest.head.ref
+    )
+
+    return repository
   }
 
   public async dispatchURLAction(action: URLActionType): Promise<void> {
@@ -1702,16 +1769,16 @@ export class Dispatcher {
   /**
    * Sets the user's preference for handling uncommitted changes when switching branches
    */
-  public setUncommittedChangesStrategyKindSetting(
-    value: UncommittedChangesStrategyKind
+  public setUncommittedChangesStrategySetting(
+    value: UncommittedChangesStrategy
   ): Promise<void> {
-    return this.appStore._setUncommittedChangesStrategyKindSetting(value)
+    return this.appStore._setUncommittedChangesStrategySetting(value)
   }
 
   /**
    * Sets the user's preference for an external program to open repositories in.
    */
-  public setExternalEditor(editor: ExternalEditor): Promise<void> {
+  public setExternalEditor(editor: string): Promise<void> {
     return this.appStore._setExternalEditor(editor)
   }
 
@@ -1722,7 +1789,7 @@ export class Dispatcher {
     return this.appStore._setShell(shell)
   }
 
-  public async checkoutLocalBranch(repository: Repository, branch: string) {
+  private async checkoutLocalBranch(repository: Repository, branch: string) {
     let shouldCheckoutBranch = true
 
     const state = this.repositoryStateManager.get(repository)
@@ -1749,63 +1816,12 @@ export class Dispatcher {
     }
   }
 
-  private async handleCloneInDesktopOptions(
-    repository: Repository,
-    action: IOpenRepositoryFromURLAction
-  ): Promise<void> {
-    const { filepath, pr, branch } = action
-
-    if (pr != null && branch != null) {
-      // we need to refetch for a forked PR and check that out
-      await this.fetchRefspec(repository, `pull/${pr}/head:${branch}`)
-    }
-
-    // ensure a fresh clone repository has it's in-memory state
-    // up-to-date before performing the "Clone in Desktop" steps
-    await this.appStore._refreshRepository(repository)
-
-    const state = this.repositoryStateManager.get(repository)
-    const branches = state.branchesState.allBranches
-
-    if (pr == null && branch != null) {
-      // I don't want to invoke Git functionality from the dispatcher, which
-      // would help by using getDefaultRemote here to get the definitive ref,
-      // so this falls back to finding any remote branch matching the name
-      // received from the "Clone in Desktop" action
-      const localBranch =
-        branches.find(b => b.upstreamWithoutRemote === branch) || null
-
-      if (localBranch == null) {
-        await this.fetch(repository, FetchType.BackgroundTask)
-      }
-    }
-
-    if (branch != null) {
-      await this.checkoutLocalBranch(repository, branch)
-    }
-
-    if (filepath != null) {
-      const fullPath = Path.join(repository.path, filepath)
-      // because Windows uses different path separators here
-      const normalized = Path.normalize(fullPath)
-      shell.showItemInFolder(normalized)
-    }
-  }
-
   private async openOrCloneRepository(url: string): Promise<Repository | null> {
     const state = this.appStore.getState()
     const repositories = state.repositories
-    const existingRepository = repositories.find(r => {
-      if (r instanceof Repository) {
-        const gitHubRepository = r.gitHubRepository
-        if (!gitHubRepository) {
-          return false
-        }
-        return urlMatchesCloneURL(url, gitHubRepository)
-      } else {
-        return false
-      }
-    })
+    const existingRepository = repositories.find(r =>
+      this.doesRepositoryMatchUrl(r, url)
+    )
 
     if (existingRepository) {
       return await this.selectRepository(existingRepository)
@@ -1886,6 +1902,35 @@ export class Dispatcher {
         await this.checkoutBranch(retryAction.repository, retryAction.branch)
         break
 
+      case RetryActionType.Merge:
+        return this.mergeBranch(
+          retryAction.repository,
+          retryAction.theirBranch,
+          null
+        )
+
+      case RetryActionType.Rebase:
+        return this.rebase(
+          retryAction.repository,
+          retryAction.baseBranch,
+          retryAction.targetBranch
+        )
+      case RetryActionType.CherryPick:
+        return this.cherryPick(
+          retryAction.repository,
+          retryAction.targetBranch,
+          retryAction.commits,
+          retryAction.sourceBranch
+        )
+      case RetryActionType.CreateBranchForCherryPick:
+        return this.startCherryPickWithBranchName(
+          retryAction.repository,
+          retryAction.targetBranchName,
+          retryAction.startPoint,
+          retryAction.noTrackOption,
+          retryAction.commits,
+          retryAction.sourceBranch
+        )
       default:
         return assertNever(retryAction, `Unknown retry action: ${retryAction}`)
     }
@@ -1907,6 +1952,11 @@ export class Dispatcher {
       repository,
       file
     )
+  }
+
+  /** Change the side by side diff setting */
+  public onShowSideBySideDiffChanged(showSideBySideDiff: boolean) {
+    return this.appStore._setShowSideBySideDiff(showSideBySideDiff)
   }
 
   /** Install the global Git LFS filters. */
@@ -1994,10 +2044,20 @@ export class Dispatcher {
 
   /** Checks out a PR whose ref exists locally or in a forked repo. */
   public async checkoutPullRequest(
-    repository: Repository,
+    repository: RepositoryWithGitHubRepository,
     pullRequest: PullRequest
   ): Promise<void> {
-    return this.appStore._checkoutPullRequest(repository, pullRequest)
+    if (pullRequest.head.gitHubRepository.cloneURL === null) {
+      return
+    }
+
+    return this.appStore._checkoutPullRequest(
+      repository,
+      pullRequest.pullRequestNumber,
+      pullRequest.head.gitHubRepository.owner.login,
+      pullRequest.head.gitHubRepository.cloneURL,
+      pullRequest.head.ref
+    )
   }
 
   /**
@@ -2027,7 +2087,7 @@ export class Dispatcher {
   }
 
   /**
-   * Initialze the compare state for the current repository.
+   * Initialize the compare state for the current repository.
    */
   public initializeCompare(
     repository: Repository,
@@ -2113,7 +2173,7 @@ export class Dispatcher {
    */
   public async convertRepositoryToFork(
     repository: RepositoryWithGitHubRepository,
-    fork: IAPIRepository
+    fork: IAPIFullRepository
   ): Promise<Repository> {
     return this.appStore._convertRepositoryToFork(repository, fork)
   }
@@ -2170,46 +2230,11 @@ export class Dispatcher {
   }
 
   /**
-   * Set the automatically switch application-wide theme
-   */
-  public onAutomaticallySwitchThemeChanged(theme: boolean) {
-    return this.appStore._setAutomaticallySwitchTheme(theme)
-  }
-
-  /**
    * Increments either the `repoWithIndicatorClicked` or
    * the `repoWithoutIndicatorClicked` metric
    */
   public recordRepoClicked(repoHasIndicator: boolean) {
     return this.statsStore.recordRepoClicked(repoHasIndicator)
-  }
-
-  /** The number of times the user dismisses the diverged branch notification
-   * Increments the `divergingBranchBannerDismissal` metric
-   */
-  public recordDivergingBranchBannerDismissal() {
-    return this.statsStore.recordDivergingBranchBannerDismissal()
-  }
-
-  /**
-   * Increments the `divergingBranchBannerInitiatedCompare` metric
-   */
-  public recordDivergingBranchBannerInitiatedCompare() {
-    return this.statsStore.recordDivergingBranchBannerInitiatedCompare()
-  }
-
-  /**
-   * Increments the `divergingBranchBannerInfluencedMerge` metric
-   */
-  public recordDivergingBranchBannerInfluencedMerge() {
-    return this.statsStore.recordDivergingBranchBannerInfluencedMerge()
-  }
-
-  /**
-   * Increments the `divergingBranchBannerInitatedMerge` metric
-   */
-  public recordDivergingBranchBannerInitatedMerge() {
-    return this.statsStore.recordDivergingBranchBannerInitatedMerge()
   }
 
   /**
@@ -2304,7 +2329,7 @@ export class Dispatcher {
   public tryGetCommitStatus(
     repository: GitHubRepository,
     ref: string
-  ): IAPIRefStatus | null {
+  ): ICombinedRefCheck | null {
     return this.commitStatusStore.tryGetStatus(repository, ref)
   }
 
@@ -2323,6 +2348,24 @@ export class Dispatcher {
     callback: StatusCallBack
   ): IDisposable {
     return this.commitStatusStore.subscribe(repository, ref, callback)
+  }
+
+  /**
+   * Creates a stash for the current branch. Note that this will
+   * override any stash that already exists for the current branch.
+   *
+   * @param repository
+   * @param showConfirmationDialog  Whether to show a confirmation dialog if an
+   *                                existing stash exists (defaults to true).
+   */
+  public createStashForCurrentBranch(
+    repository: Repository,
+    showConfirmationDialog: boolean = true
+  ) {
+    return this.appStore._createStashForCurrentBranch(
+      repository,
+      showConfirmationDialog
+    )
   }
 
   /** Drops the given stash in the given repository */
@@ -2366,7 +2409,7 @@ export class Dispatcher {
 
   /**
    * Increment the number of times the user has opened their repository in
-   * Finder/Explorerfrom the suggested next steps view
+   * Finder/Explorer from the suggested next steps view
    */
   public recordSuggestedStepOpenWorkingDirectory(): Promise<void> {
     return this.statsStore.recordSuggestedStepOpenWorkingDirectory()
@@ -2410,19 +2453,6 @@ export class Dispatcher {
    */
   public recordSuggestedStepViewStash(): Promise<void> {
     return this.statsStore.recordSuggestedStepViewStash()
-  }
-
-  /**
-   * Moves unconmitted changes to the branch being checked out
-   */
-  public async moveChangesToBranchAndCheckout(
-    repository: Repository,
-    branchToCheckout: Branch
-  ) {
-    return this.appStore._moveChangesToBranchAndCheckout(
-      repository,
-      branchToCheckout
-    )
   }
 
   /** Record when the user takes no action on the stash entry */
@@ -2480,5 +2510,460 @@ export class Dispatcher {
     } else {
       return false
     }
+  }
+
+  public setRepositoryIndicatorsEnabled(repositoryIndicatorsEnabled: boolean) {
+    this.appStore._setRepositoryIndicatorsEnabled(repositoryIndicatorsEnabled)
+  }
+
+  public setCommitSpellcheckEnabled(commitSpellcheckEnabled: boolean) {
+    this.appStore._setCommitSpellcheckEnabled(commitSpellcheckEnabled)
+  }
+
+  public recordDiffOptionsViewed() {
+    return this.statsStore.recordDiffOptionsViewed()
+  }
+
+  /**
+   * Move the cherry pick flow to a new state.
+   */
+  public setCherryPickFlowStep(
+    repository: Repository,
+    step: CherryPickFlowStep
+  ): Promise<void> {
+    return this.appStore._setCherryPickFlowStep(repository, step)
+  }
+
+  /** Initialize and start the cherry pick operation */
+  public async initializeCherryPickFlow(
+    repository: Repository,
+    commits: ReadonlyArray<CommitOneLine>
+  ): Promise<void> {
+    this.appStore._initializeCherryPickProgress(repository, commits)
+    this.switchCherryPickingFlowToShowProgress(repository)
+  }
+
+  private logHowToRevertCherryPick(
+    targetBranchName: string,
+    beforeSha: string | null
+  ) {
+    log.info(
+      `[cherryPick] starting cherry-pick for ${targetBranchName} at ${beforeSha}`
+    )
+    log.info(
+      `[cherryPick] to restore the previous state if this completed cherry-pick is unsatisfactory:`
+    )
+    log.info(`[cherryPick] - git checkout ${targetBranchName}`)
+    log.info(`[cherryPick] - git reset ${beforeSha} --hard`)
+  }
+
+  /** Starts a cherry pick of the given commits onto the target branch */
+  public async cherryPick(
+    repository: Repository,
+    targetBranch: Branch,
+    commits: ReadonlyArray<CommitOneLine>,
+    sourceBranch: Branch | null
+  ): Promise<void> {
+    this.initializeCherryPickFlow(repository, commits)
+    this.dismissCherryPickIntro()
+
+    const retry: RetryAction = {
+      type: RetryActionType.CherryPick,
+      repository,
+      targetBranch,
+      commits,
+      sourceBranch,
+    }
+
+    if (this.appStore._checkForUncommittedChanges(repository, retry)) {
+      this.appStore._endCherryPickFlow(repository)
+      return
+    }
+
+    const { name, tip } = targetBranch
+    this.appStore._setCherryPickTargetBranchUndoSha(repository, tip.sha)
+
+    if (commits.length > 1) {
+      this.statsStore.recordCherryPickMultipleCommits()
+    }
+
+    const result = await this.appStore._checkOutBranchAndCherryPick(
+      repository,
+      targetBranch,
+      commits
+    )
+
+    if (result !== CherryPickResult.UnableToStart) {
+      this.logHowToRevertCherryPick(name, tip.sha)
+    }
+
+    this.processCherryPickResult(
+      repository,
+      result,
+      name,
+      commits,
+      sourceBranch
+    )
+  }
+
+  public async startCherryPickWithBranchName(
+    repository: Repository,
+    targetBranchName: string,
+    startPoint: string | null,
+    noTrackOption: boolean = false,
+    commits: ReadonlyArray<CommitOneLine>,
+    sourceBranch: Branch | null
+  ): Promise<void> {
+    const retry: RetryAction = {
+      type: RetryActionType.CreateBranchForCherryPick,
+      repository,
+      targetBranchName,
+      startPoint,
+      noTrackOption,
+      commits,
+      sourceBranch,
+    }
+
+    if (this.appStore._checkForUncommittedChanges(repository, retry)) {
+      this.appStore._endCherryPickFlow(repository)
+      return
+    }
+
+    const targetBranch = await this.appStore._createBranch(
+      repository,
+      targetBranchName,
+      startPoint,
+      noTrackOption,
+      false
+    )
+
+    if (targetBranch === undefined) {
+      log.error(
+        '[startCherryPickWithBranchName] - Unable to create branch for cherry-pick operation'
+      )
+      return
+    }
+
+    this.appStore._setCherryPickBranchCreated(repository, true)
+    this.statsStore.recordCherryPickBranchCreatedCount()
+    return this.cherryPick(repository, targetBranch, commits, sourceBranch)
+  }
+
+  /**
+   * This method starts a cherry pick after drag and dropping on a branch.
+   * It needs to:
+   *  - get the current branch,
+   *  - get the commits dragged from cherry picking state
+   *  - invoke popup
+   *  - invoke cherry pick
+   */
+  public async startCherryPickWithBranch(
+    repository: Repository,
+    targetBranch: Branch
+  ): Promise<void> {
+    const { branchesState, cherryPickState } = this.repositoryStateManager.get(
+      repository
+    )
+
+    if (
+      cherryPickState.step == null ||
+      cherryPickState.step.kind !== CherryPickStepKind.CommitsChosen
+    ) {
+      log.warn(
+        '[cherryPick] Invalid Cherry-picking State: Could not determine selected commits.'
+      )
+      return
+    }
+
+    const { tip } = branchesState
+    if (tip.kind !== TipState.Valid) {
+      throw new Error(
+        'Tip is not in a valid state, which is required to start the cherry-pick flow.'
+      )
+    }
+    const sourceBranch = tip.branch
+    const commits = cherryPickState.step.commits
+
+    this.showPopup({
+      type: PopupType.CherryPick,
+      repository,
+      commits,
+      sourceBranch,
+    })
+
+    this.statsStore.recordCherryPickViaDragAndDrop()
+    this.setCherryPickBranchCreated(repository, false)
+    this.cherryPick(repository, targetBranch, commits, sourceBranch)
+  }
+
+  /**
+   * Continue with the cherryPick after the user has resolved all conflicts with
+   * tracked files in the working directory.
+   */
+  public async continueCherryPick(
+    repository: Repository,
+    files: ReadonlyArray<WorkingDirectoryFileChange>,
+    conflictsState: CherryPickConflictState,
+    commits: ReadonlyArray<CommitOneLine>,
+    sourceBranch: Branch | null
+  ): Promise<void> {
+    await this.switchCherryPickingFlowToShowProgress(repository)
+
+    const result = await this.appStore._continueCherryPick(
+      repository,
+      files,
+      conflictsState.manualResolutions
+    )
+
+    if (result === CherryPickResult.CompletedWithoutError) {
+      this.statsStore.recordCherryPickSuccessfulWithConflicts()
+    }
+
+    this.processCherryPickResult(
+      repository,
+      result,
+      conflictsState.targetBranchName,
+      commits,
+      sourceBranch
+    )
+  }
+
+  /**
+   * Obtains the current app conflict state and switches cherry pick flow to
+   * show conflicts step
+   */
+  private startConflictCherryPickFlow(repository: Repository): void {
+    const stateAfter = this.repositoryStateManager.get(repository)
+    const { conflictState } = stateAfter.changesState
+    if (conflictState === null || !isCherryPickConflictState(conflictState)) {
+      log.warn(
+        '[cherryPick] - conflict state was null or not in a cherry-pick conflict state - unable to continue'
+      )
+      return
+    }
+    this.setCherryPickFlowStep(repository, {
+      kind: CherryPickStepKind.ShowConflicts,
+      conflictState,
+    })
+    this.statsStore.recordCherryPickConflictsEncountered()
+  }
+
+  /** Tidy up the cherry pick flow after reaching the end */
+  /** Wrap cherry pick up actions:
+   * - closes flow popup
+   * - displays success banner
+   * - clears out cherry pick flow state
+   */
+  private async completeCherryPick(
+    repository: Repository,
+    targetBranchName: string,
+    countCherryPicked: number,
+    sourceBranch: Branch | null
+  ): Promise<void> {
+    this.closePopup()
+
+    const banner: Banner = {
+      type: BannerType.SuccessfulCherryPick,
+      targetBranchName,
+      countCherryPicked,
+      onUndoCherryPick: () => {
+        this.undoCherryPick(
+          repository,
+          targetBranchName,
+          sourceBranch,
+          countCherryPicked
+        )
+      },
+    }
+    this.setBanner(banner)
+
+    this.appStore._endCherryPickFlow(repository)
+
+    this.statsStore.recordCherryPickSuccessful()
+
+    await this.refreshRepository(repository)
+  }
+
+  /** Aborts an ongoing cherry pick and switches back to the source branch. */
+  public async abortCherryPick(
+    repository: Repository,
+    sourceBranch: Branch | null
+  ) {
+    await this.appStore._abortCherryPick(repository, sourceBranch)
+    await this.appStore._loadStatus(repository)
+    this.appStore._endCherryPickFlow(repository)
+    await this.refreshRepository(repository)
+  }
+
+  /**
+   * Update the cherry pick state to indicate the user has resolved conflicts in
+   * the current repository.
+   */
+  public setCherryPickConflictsResolved(repository: Repository) {
+    return this.appStore._setCherryPickConflictsResolved(repository)
+  }
+
+  /**
+   * Moves cherry pick flow step to progress and defers to allow user to
+   * see the cherry picking progress dialog instead of suddenly appearing
+   * and disappearing again.
+   */
+  private async switchCherryPickingFlowToShowProgress(repository: Repository) {
+    this.setCherryPickFlowStep(repository, {
+      kind: CherryPickStepKind.ShowProgress,
+    })
+    await sleep(500)
+  }
+
+  /**
+   * Processes the cherry pick result.
+   *  1. Completes the cherry pick with banner if successful.
+   *  2. Moves cherry pick flow if conflicts.
+   *  3. Handles errors.
+   */
+  private async processCherryPickResult(
+    repository: Repository,
+    cherryPickResult: CherryPickResult,
+    targetBranchName: string,
+    commits: ReadonlyArray<CommitOneLine>,
+    sourceBranch: Branch | null
+  ): Promise<void> {
+    // This will update the conflict state of the app. This is needed to start
+    // conflict flow if cherry pick results in conflict.
+    await this.appStore._loadStatus(repository)
+
+    switch (cherryPickResult) {
+      case CherryPickResult.CompletedWithoutError:
+        await this.changeCommitSelection(repository, [commits[0].sha])
+        await this.completeCherryPick(
+          repository,
+          targetBranchName,
+          commits.length,
+          sourceBranch
+        )
+        break
+      case CherryPickResult.ConflictsEncountered:
+        this.startConflictCherryPickFlow(repository)
+        break
+      case CherryPickResult.UnableToStart:
+        // This is an expected error such as not being able to checkout the
+        // target branch which means the cherry pick operation never started or
+        // was cleanly aborted.
+        this.appStore._endCherryPickFlow(repository)
+        break
+      default:
+        // If the user closes error dialog and tries to cherry pick again, it
+        // will fail again due to ongoing cherry pick. Thus, if we get to an
+        // unhandled error state, we want to abort any ongoing cherry pick.
+        // A known error is if a user attempts to cherry pick a merge commit.
+        this.appStore._clearCherryPickingHead(repository, sourceBranch)
+        this.appStore._endCherryPickFlow(repository)
+        this.appStore._closePopup()
+    }
+  }
+
+  /**
+   * Update the cherry pick progress in application state by querying the Git
+   * repository state.
+   */
+  public setCherryPickProgressFromState(repository: Repository) {
+    return this.appStore._setCherryPickProgressFromState(repository)
+  }
+
+  /** Method to dismiss cherry pick intro */
+  public dismissCherryPickIntro(): void {
+    this.appStore._dismissCherryPickIntro()
+  }
+
+  /**
+   * This method will perform a hard reset back to the tip of the target branch
+   * before the cherry pick happened.
+   */
+  private async undoCherryPick(
+    repository: Repository,
+    targetBranchName: string,
+    sourceBranch: Branch | null,
+    commitsCount: number
+  ): Promise<void> {
+    const result = await this.appStore._undoCherryPick(
+      repository,
+      targetBranchName,
+      sourceBranch,
+      commitsCount
+    )
+    if (result) {
+      this.statsStore.recordCherryPickUndone()
+    }
+  }
+
+  /** Method to record cherry pick initiated via the context menu. */
+  public recordCherryPickViaContextMenu() {
+    this.statsStore.recordCherryPickViaContextMenu()
+  }
+
+  /** Method to record cherry pick started via drag and drop and canceled. */
+  public recordCherryPickDragStartedAndCanceled() {
+    this.statsStore.recordCherryPickDragStartedAndCanceled()
+  }
+
+  /** Method to reset cherry picking state. */
+  public endCherryPickFlow(repository: Repository) {
+    this.appStore._endCherryPickFlow(repository)
+  }
+
+  /** Method to set the drag element */
+  public setDragElement(dragElement: DragElement): void {
+    this.appStore._setDragElement(dragElement)
+  }
+
+  /** Method to clear the drag element */
+  public clearDragElement(): void {
+    this.appStore._setDragElement(null)
+  }
+
+  /** Set Cherry Pick Flow Step For Create Branch */
+  public async setCherryPickCreateBranchFlowStep(
+    repository: Repository,
+    targetBranchName: string
+  ): Promise<void> {
+    const { branchesState } = this.repositoryStateManager.get(repository)
+    const { defaultBranch, allBranches, tip } = branchesState
+
+    if (tip.kind === TipState.Unknown) {
+      this.appStore._clearCherryPickingHead(repository, null)
+      this.appStore._endCherryPickFlow(repository)
+      log.error('Tip is in unknown state. Cherry-pick aborted.')
+      return
+    }
+
+    const isGHRepo = isRepositoryWithGitHubRepository(repository)
+    const upstreamGhRepo = isGHRepo
+      ? getNonForkGitHubRepository(repository as RepositoryWithGitHubRepository)
+      : null
+    const upstreamDefaultBranch = isGHRepo
+      ? findDefaultUpstreamBranch(
+          repository as RepositoryWithGitHubRepository,
+          allBranches
+        )
+      : null
+
+    const step: CreateBranchStep = {
+      kind: CherryPickStepKind.CreateBranch,
+      allBranches,
+      defaultBranch,
+      upstreamDefaultBranch,
+      upstreamGhRepo,
+      tip,
+      targetBranchName,
+    }
+    return this.appStore._setCherryPickFlowStep(repository, step)
+  }
+
+  /** Set cherry-pick branch created state */
+  public setCherryPickBranchCreated(
+    repository: Repository,
+    branchCreated: boolean
+  ): void {
+    this.appStore._setCherryPickBranchCreated(repository, branchCreated)
   }
 }

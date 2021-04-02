@@ -27,6 +27,7 @@ export function enableProgressBarOnIcon(): boolean {
 }
 
 /** Should the app enable beta features? */
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
 //@ts-ignore: this will be used again in the future
 function enableBetaFeatures(): boolean {
   return enableDevelopmentFeatures() || __RELEASE_CHANNEL__ === 'beta'
@@ -46,20 +47,20 @@ export function enableWSLDetection(): boolean {
   return enableBetaFeatures()
 }
 
-/**
- * Should we show the create fork dialog flow?
- */
-export function enableCreateForkFlow(): boolean {
+/** Should the app show hide whitespace in changes tab */
+export function enableHideWhitespaceInDiffOption(): boolean {
+  return enableDevelopmentFeatures()
+}
+
+/** Should the app use the shiny new TCP-based trampoline? */
+export function enableDesktopTrampoline(): boolean {
   return true
 }
 
 /**
- * Whether or not we should attempt to detect the specific curl
- * error from the WinSSL (schannel) https backend when it fails
- * to check the revocation details of a certificate due to lacking
- * CRL distribution points and/or an offiline revocation server.
+ * Should we show the create fork dialog flow?
  */
-export function enableSchannelCheckRevokeOptOut(): boolean {
+export function enableCreateForkFlow(): boolean {
   return true
 }
 
@@ -95,16 +96,6 @@ export function enableForkyCreateBranchUI(): boolean {
 }
 
 /**
- * Should we show the NDDB banner?
- *
- * (It's a notification in the history sidebar that there
- * are new commits upstream.)
- */
-export function enableNDDBBanner(): boolean {
-  return false
-}
-
-/**
  * Should we show the git tag information in the app UI?
  */
 export function enableGitTagsDisplay(): boolean {
@@ -130,5 +121,47 @@ export function enableForkSettings(): boolean {
  * Should we show the discard lines/hunks context menu item?
  */
 export function enableDiscardLines(): boolean {
+  return true
+}
+
+/**
+ * Should we show the checkbox to enable side by side diffs?
+ *
+ * Note: side by side diffs will use the new diff viewer.
+ */
+export function enableSideBySideDiffs(): boolean {
+  return true
+}
+
+/**
+ * Should we use the new diff viewer for unified diffs?
+ */
+export function enableExperimentalDiffViewer(): boolean {
+  return false
+}
+
+/**
+ * Should we allow to change the default branch when creating new repositories?
+ */
+export function enableDefaultBranchSetting(): boolean {
+  return true
+}
+
+/**
+ * Should we allow reporting unhandled rejections as if they were crashes?
+ */
+export function enableUnhandledRejectionReporting(): boolean {
   return enableBetaFeatures()
+}
+
+/**
+ * Should we allow cherry picking
+ */
+export function enableCherryPicking(): boolean {
+  return true
+}
+
+/** Should we allow expanding text diffs? */
+export function enableTextDiffExpansion(): boolean {
+  return enableDevelopmentFeatures()
 }

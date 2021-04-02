@@ -1,7 +1,6 @@
 import * as React from 'react'
 import { Account } from '../../models/account'
 import { PreferencesTab } from '../../models/preferences'
-import { ExternalEditor } from '../../lib/editors'
 import { Dispatcher } from '../dispatcher'
 import { TabBar, TabBarType } from '../tab-bar'
 import { Accounts } from './accounts'
@@ -12,19 +11,21 @@ import { Dialog, DialogFooter, DialogError } from '../dialog'
 import {
   getGlobalConfigValue,
   setGlobalConfigValue,
-  getGlobalBooleanConfigValue,
 } from '../../lib/git/config'
 import { lookupPreferredEmail } from '../../lib/email'
 import { Shell, getAvailableShells } from '../../lib/shells'
 import { getAvailableEditors } from '../../lib/editors/lookup'
-import { gitAuthorNameIsValid } from './identifier-rules'
+import {
+  gitAuthorNameIsValid,
+  InvalidGitAuthorNameMessage,
+} from '../lib/identifier-rules'
 import { Appearance } from './appearance'
 import { ApplicationTheme } from '../lib/application-theme'
 import { OkCancelButtonGroup } from '../dialog/ok-cancel-button-group'
 import { Integrations } from './integrations'
 import {
-  UncommittedChangesStrategyKind,
-  uncommittedChangesStrategyKindDefault,
+  UncommittedChangesStrategy,
+  defaultUncommittedChangesStrategy,
 } from '../../models/uncommitted-changes-strategy'
 import { Octicon, OcticonSymbol } from '../octicons'
 import {
@@ -32,39 +33,47 @@ import {
   parseConfigLockFilePathFromError,
 } from '../../lib/git'
 import { ConfigLockFileExists } from '../lib/config-lock-file-exists'
+import {
+  setDefaultBranch,
+  getDefaultBranch,
+} from '../../lib/helpers/default-branch'
+import { Prompts } from './prompts'
+import { Repository } from '../../models/repository'
 
 interface IPreferencesProps {
   readonly dispatcher: Dispatcher
   readonly dotComAccount: Account | null
   readonly enterpriseAccount: Account | null
+  readonly repository: Repository | null
   readonly onDismissed: () => void
   readonly optOutOfUsageTracking: boolean
   readonly initialSelectedTab?: PreferencesTab
   readonly confirmRepositoryRemoval: boolean
   readonly confirmDiscardChanges: boolean
   readonly confirmForcePush: boolean
-  readonly uncommittedChangesStrategyKind: UncommittedChangesStrategyKind
-  readonly selectedExternalEditor: ExternalEditor | null
+  readonly uncommittedChangesStrategy: UncommittedChangesStrategy
+  readonly selectedExternalEditor: string | null
   readonly selectedShell: Shell
   readonly selectedTheme: ApplicationTheme
-  readonly automaticallySwitchTheme: boolean
+  readonly repositoryIndicatorsEnabled: boolean
 }
 
 interface IPreferencesState {
   readonly selectedIndex: PreferencesTab
   readonly committerName: string
   readonly committerEmail: string
+  readonly defaultBranch: string
   readonly initialCommitterName: string | null
   readonly initialCommitterEmail: string | null
+  readonly initialDefaultBranch: string | null
   readonly disallowedCharactersMessage: string | null
   readonly optOutOfUsageTracking: boolean
   readonly confirmRepositoryRemoval: boolean
   readonly confirmDiscardChanges: boolean
   readonly confirmForcePush: boolean
-  readonly automaticallySwitchTheme: boolean
-  readonly uncommittedChangesStrategyKind: UncommittedChangesStrategyKind
-  readonly availableEditors: ReadonlyArray<ExternalEditor>
-  readonly selectedExternalEditor: ExternalEditor | null
+  readonly uncommittedChangesStrategy: UncommittedChangesStrategy
+  readonly availableEditors: ReadonlyArray<string>
+  readonly selectedExternalEditor: string | null
   readonly availableShells: ReadonlyArray<Shell>
   readonly selectedShell: Shell
   /**
@@ -75,8 +84,7 @@ interface IPreferencesState {
    * choice to delete the lock file.
    */
   readonly existingLockFilePath?: string
-  readonly initialSchannelCheckRevoke: boolean | null
-  readonly schannelCheckRevoke: boolean | null
+  readonly repositoryIndicatorsEnabled: boolean
 }
 
 /** The app-level preferences component. */
@@ -91,35 +99,28 @@ export class Preferences extends React.Component<
       selectedIndex: this.props.initialSelectedTab || PreferencesTab.Accounts,
       committerName: '',
       committerEmail: '',
+      defaultBranch: '',
       initialCommitterName: null,
       initialCommitterEmail: null,
+      initialDefaultBranch: null,
       disallowedCharactersMessage: null,
       availableEditors: [],
       optOutOfUsageTracking: false,
       confirmRepositoryRemoval: false,
       confirmDiscardChanges: false,
       confirmForcePush: false,
-      uncommittedChangesStrategyKind: uncommittedChangesStrategyKindDefault,
-      automaticallySwitchTheme: false,
+      uncommittedChangesStrategy: defaultUncommittedChangesStrategy,
       selectedExternalEditor: this.props.selectedExternalEditor,
       availableShells: [],
       selectedShell: this.props.selectedShell,
-      initialSchannelCheckRevoke: null,
-      schannelCheckRevoke: null,
+      repositoryIndicatorsEnabled: this.props.repositoryIndicatorsEnabled,
     }
   }
 
   public async componentWillMount() {
     const initialCommitterName = await getGlobalConfigValue('user.name')
     const initialCommitterEmail = await getGlobalConfigValue('user.email')
-
-    // There's no point in us reading http.schannelCheckRevoke on macOS, it's
-    // just a wasted Git process since the option only affects Windows. Besides,
-    // the checkbox will not be visible unless running on Windows so we'll just
-    // default to the default value for lack of anything better.
-    const initialSchannelCheckRevoke = __WIN32__
-      ? await getGlobalBooleanConfigValue('http.schannelCheckRevoke')
-      : null
+    const initialDefaultBranch = await getDefaultBranch()
 
     let committerName = initialCommitterName
     let committerEmail = initialCommitterEmail
@@ -133,10 +134,7 @@ export class Preferences extends React.Component<
         }
 
         if (!committerEmail) {
-          const found = lookupPreferredEmail(account)
-          if (found) {
-            committerEmail = found.email
-          }
+          committerEmail = lookupPreferredEmail(account)
         }
       }
     }
@@ -155,17 +153,17 @@ export class Preferences extends React.Component<
     this.setState({
       committerName,
       committerEmail,
+      defaultBranch: initialDefaultBranch,
       initialCommitterName,
       initialCommitterEmail,
+      initialDefaultBranch,
       optOutOfUsageTracking: this.props.optOutOfUsageTracking,
       confirmRepositoryRemoval: this.props.confirmRepositoryRemoval,
       confirmDiscardChanges: this.props.confirmDiscardChanges,
       confirmForcePush: this.props.confirmForcePush,
-      uncommittedChangesStrategyKind: this.props.uncommittedChangesStrategyKind,
+      uncommittedChangesStrategy: this.props.uncommittedChangesStrategy,
       availableShells,
       availableEditors,
-      initialSchannelCheckRevoke,
-      schannelCheckRevoke: initialSchannelCheckRevoke,
     })
   }
 
@@ -197,8 +195,12 @@ export class Preferences extends React.Component<
               Git
             </span>
             <span>
-              <Octicon className="icon" symbol={OcticonSymbol.paintcan} />
+              <Octicon className="icon" symbol={OcticonSymbol.paintbrush} />
               Appearance
+            </span>
+            <span>
+              <Octicon className="icon" symbol={OcticonSymbol.question} />
+              Prompts
             </span>
             <span>
               <Octicon className="icon" symbol={OcticonSymbol.settings} />
@@ -283,8 +285,12 @@ export class Preferences extends React.Component<
             <Git
               name={this.state.committerName}
               email={this.state.committerEmail}
+              defaultBranch={this.state.defaultBranch}
+              dotComAccount={this.props.dotComAccount}
+              enterpriseAccount={this.props.enterpriseAccount}
               onNameChanged={this.onCommitterNameChanged}
               onEmailChanged={this.onCommitterEmailChanged}
+              onDefaultBranchChanged={this.onDefaultBranchChanged}
             />
           </>
         )
@@ -295,34 +301,37 @@ export class Preferences extends React.Component<
           <Appearance
             selectedTheme={this.props.selectedTheme}
             onSelectedThemeChanged={this.onSelectedThemeChanged}
-            automaticallySwitchTheme={this.props.automaticallySwitchTheme}
-            onAutomaticallySwitchThemeChanged={
-              this.onAutomaticallySwitchThemeChanged
-            }
           />
         )
         break
-      case PreferencesTab.Advanced: {
+      case PreferencesTab.Prompts: {
         View = (
-          <Advanced
-            optOutOfUsageTracking={this.state.optOutOfUsageTracking}
+          <Prompts
             confirmRepositoryRemoval={this.state.confirmRepositoryRemoval}
             confirmDiscardChanges={this.state.confirmDiscardChanges}
             confirmForcePush={this.state.confirmForcePush}
-            uncommittedChangesStrategyKind={
-              this.state.uncommittedChangesStrategyKind
-            }
-            onOptOutofReportingchanged={this.onOptOutofReportingChanged}
             onConfirmRepositoryRemovalChanged={
               this.onConfirmRepositoryRemovalChanged
             }
             onConfirmDiscardChangesChanged={this.onConfirmDiscardChangesChanged}
             onConfirmForcePushChanged={this.onConfirmForcePushChanged}
-            onUncommittedChangesStrategyKindChanged={
-              this.onUncommittedChangesStrategyKindChanged
+          />
+        )
+        break
+      }
+      case PreferencesTab.Advanced: {
+        View = (
+          <Advanced
+            optOutOfUsageTracking={this.state.optOutOfUsageTracking}
+            repositoryIndicatorsEnabled={this.state.repositoryIndicatorsEnabled}
+            uncommittedChangesStrategy={this.state.uncommittedChangesStrategy}
+            onOptOutofReportingchanged={this.onOptOutofReportingChanged}
+            onUncommittedChangesStrategyChanged={
+              this.onUncommittedChangesStrategyChanged
             }
-            schannelCheckRevoke={this.state.schannelCheckRevoke}
-            onSchannelCheckRevokeChanged={this.onSchannelCheckRevokeChanged}
+            onRepositoryIndicatorsEnabledChanged={
+              this.onRepositoryIndicatorsEnabledChanged
+            }
           />
         )
         break
@@ -332,6 +341,12 @@ export class Preferences extends React.Component<
     }
 
     return <div className="tab-container">{View}</div>
+  }
+
+  private onRepositoryIndicatorsEnabledChanged = (
+    repositoryIndicatorsEnabled: boolean
+  ) => {
+    this.setState({ repositoryIndicatorsEnabled })
   }
 
   private onLockFileDeleted = () => {
@@ -358,10 +373,10 @@ export class Preferences extends React.Component<
     this.setState({ confirmForcePush: value })
   }
 
-  private onUncommittedChangesStrategyKindChanged = (
-    value: UncommittedChangesStrategyKind
+  private onUncommittedChangesStrategyChanged = (
+    uncommittedChangesStrategy: UncommittedChangesStrategy
   ) => {
-    this.setState({ uncommittedChangesStrategyKind: value })
+    this.setState({ uncommittedChangesStrategy })
   }
 
   private onCommitterNameChanged = (committerName: string) => {
@@ -369,7 +384,7 @@ export class Preferences extends React.Component<
       committerName,
       disallowedCharactersMessage: gitAuthorNameIsValid(committerName)
         ? null
-        : 'Name is invalid, it consists only of disallowed characters.',
+        : InvalidGitAuthorNameMessage,
     })
   }
 
@@ -377,7 +392,11 @@ export class Preferences extends React.Component<
     this.setState({ committerEmail })
   }
 
-  private onSelectedEditorChanged = (editor: ExternalEditor) => {
+  private onDefaultBranchChanged = (defaultBranch: string) => {
+    this.setState({ defaultBranch })
+  }
+
+  private onSelectedEditorChanged = (editor: string) => {
     this.setState({ selectedExternalEditor: editor })
   }
 
@@ -387,18 +406,6 @@ export class Preferences extends React.Component<
 
   private onSelectedThemeChanged = (theme: ApplicationTheme) => {
     this.props.dispatcher.setSelectedTheme(theme)
-  }
-
-  private onAutomaticallySwitchThemeChanged = (
-    automaticallySwitchTheme: boolean
-  ) => {
-    this.props.dispatcher.onAutomaticallySwitchThemeChanged(
-      automaticallySwitchTheme
-    )
-  }
-
-  private onSchannelCheckRevokeChanged = (value: boolean) => {
-    this.setState({ schannelCheckRevoke: value })
   }
 
   private renderFooter() {
@@ -411,6 +418,7 @@ export class Preferences extends React.Component<
         return null
       case PreferencesTab.Integrations:
       case PreferencesTab.Advanced:
+      case PreferencesTab.Prompts:
       case PreferencesTab.Git: {
         return (
           <DialogFooter>
@@ -428,23 +436,42 @@ export class Preferences extends React.Component<
 
   private onSave = async () => {
     try {
+      let shouldRefreshAuthor = false
+
       if (this.state.committerName !== this.state.initialCommitterName) {
         await setGlobalConfigValue('user.name', this.state.committerName)
+        shouldRefreshAuthor = true
       }
 
       if (this.state.committerEmail !== this.state.initialCommitterEmail) {
         await setGlobalConfigValue('user.email', this.state.committerEmail)
+        shouldRefreshAuthor = true
+      }
+
+      if (this.props.repository !== null && shouldRefreshAuthor) {
+        this.props.dispatcher.refreshAuthor(this.props.repository)
+      }
+
+      // If the entered default branch is empty, we don't store it and keep
+      // the previous value.
+      // We do this because the preferences dialog doesn't have error states,
+      // and since the preferences dialog have a global "Save" button (that will
+      // save all the changes performed in every single tab), we cannot
+      // block the user from clicking "Save" because the entered branch is not valid
+      // (they will not be able to know the issue if they are in a different tab).
+      if (
+        this.state.defaultBranch.length > 0 &&
+        this.state.defaultBranch !== this.state.initialDefaultBranch
+      ) {
+        await setDefaultBranch(this.state.defaultBranch)
       }
 
       if (
-        this.state.schannelCheckRevoke !==
-          this.state.initialSchannelCheckRevoke &&
-        this.state.schannelCheckRevoke !== null &&
-        __WIN32__
+        this.props.repositoryIndicatorsEnabled !==
+        this.state.repositoryIndicatorsEnabled
       ) {
-        await setGlobalConfigValue(
-          'http.schannelCheckRevoke',
-          this.state.schannelCheckRevoke.toString()
+        this.props.dispatcher.setRepositoryIndicatorsEnabled(
+          this.state.repositoryIndicatorsEnabled
         )
       }
     } catch (e) {
@@ -487,8 +514,8 @@ export class Preferences extends React.Component<
       this.state.confirmDiscardChanges
     )
 
-    await this.props.dispatcher.setUncommittedChangesStrategyKindSetting(
-      this.state.uncommittedChangesStrategyKind
+    await this.props.dispatcher.setUncommittedChangesStrategySetting(
+      this.state.uncommittedChangesStrategy
     )
 
     this.props.onDismissed()

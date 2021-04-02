@@ -1,7 +1,8 @@
 import * as React from 'react'
-import * as classNames from 'classnames'
+import classNames from 'classnames'
 import { DialogHeader } from './header'
 import { createUniqueId, releaseUniqueId } from '../lib/id-pool'
+import { getTitleBarHeight } from '../window/title-bar'
 
 /**
  * The time (in milliseconds) from when the dialog is mounted
@@ -17,9 +18,9 @@ const dismissGracePeriodMs = 250
 const DisableClickDismissalDelay = 500
 
 /**
- * Title bar height in pixels. Values taken from 'app/styles/_variables.scss'.
+ * Title bar height in pixels
  */
-const titleBarHeight = __DARWIN__ ? 22 : 28
+const titleBarHeight = getTitleBarHeight()
 
 interface IDialogProps {
   /**
@@ -436,7 +437,7 @@ export class Dialog extends React.Component<IDialogProps, IDialogState> {
     }
   }
 
-  private onDialogCancel = (e: Event) => {
+  private onDialogCancel = (e: Event | React.SyntheticEvent) => {
     e.preventDefault()
     this.onDismiss()
   }
@@ -526,17 +527,18 @@ export class Dialog extends React.Component<IDialogProps, IDialogState> {
     if (!e) {
       if (this.dialogElement) {
         this.dialogElement.removeEventListener('cancel', this.onDialogCancel)
-        this.dialogElement.removeEventListener('keydown', this.onKeyDown)
       }
     } else {
       e.addEventListener('cancel', this.onDialogCancel)
-      e.addEventListener('keydown', this.onKeyDown)
     }
 
     this.dialogElement = e
   }
 
-  private onKeyDown = (event: KeyboardEvent) => {
+  private onKeyDown = (event: React.KeyboardEvent) => {
+    if (event.defaultPrevented) {
+      return
+    }
     const shortcutKey = __DARWIN__ ? event.metaKey : event.ctrlKey
     if ((shortcutKey && event.key === 'w') || event.key === 'Escape') {
       this.onDialogCancel(event)
@@ -591,6 +593,7 @@ export class Dialog extends React.Component<IDialogProps, IDialogState> {
         ref={this.onDialogRef}
         id={this.props.id}
         onMouseDown={this.onDialogMouseDown}
+        onKeyDown={this.onKeyDown}
         className={className}
         aria-labelledby={this.state.titleId}
         tabIndex={-1}

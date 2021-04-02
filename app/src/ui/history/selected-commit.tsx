@@ -9,7 +9,6 @@ import { Commit } from '../../models/commit'
 import { IDiff, ImageDiffType } from '../../models/diff'
 
 import { encodePathAsUrl } from '../../lib/path'
-import { IGitHubUser } from '../../lib/databases'
 import { revealInFileManager } from '../../lib/app-shell'
 
 import { openFile } from '../lib/open-file'
@@ -29,6 +28,7 @@ import { showContextualMenu } from '../main-process-proxy'
 import { CommitSummary } from './commit-summary'
 import { FileList } from './file-list'
 import { SeamlessDiffSwitcher } from '../diff/seamless-diff-switcher'
+import { DragOverlay } from '../drag-overlay'
 
 interface ISelectedCommitProps {
   readonly repository: Repository
@@ -39,17 +39,20 @@ interface ISelectedCommitProps {
   readonly selectedFile: CommittedFileChange | null
   readonly currentDiff: IDiff | null
   readonly commitSummaryWidth: number
-  readonly gitHubUsers: Map<string, IGitHubUser>
   readonly selectedDiffType: ImageDiffType
   /** The name of the currently selected external editor */
   readonly externalEditorLabel?: string
 
   /**
    * Called to open a file using the user's configured applications
+   *
    * @param path The path of the file relative to the root of the repository
    */
   readonly onOpenInExternalEditor: (path: string) => void
   readonly hideWhitespaceInDiff: boolean
+
+  /** Whether we should display side by side diffs. */
+  readonly showSideBySideDiff: boolean
 
   /**
    * Called when the user requests to open a binary file in an the
@@ -62,6 +65,15 @@ interface ISelectedCommitProps {
    * to change the diff presentation mode.
    */
   readonly onChangeImageDiffType: (type: ImageDiffType) => void
+
+  /** Called when the user opens the diff options popover */
+  readonly onDiffOptionsOpened: () => void
+
+  /** Whether multiple commits are selected. */
+  readonly areMultipleCommitsSelected: boolean
+
+  /** Whether or not to show the drag overlay */
+  readonly showDragOverlay: boolean
 }
 
 interface ISelectedCommitState {
@@ -138,6 +150,7 @@ export class SelectedCommit extends React.Component<
         diff={diff}
         readOnly={true}
         hideWhitespaceInDiff={this.props.hideWhitespaceInDiff}
+        showSideBySideDiff={this.props.showSideBySideDiff}
         onOpenBinaryFile={this.props.onOpenBinaryFile}
         onChangeImageDiffType={this.props.onChangeImageDiffType}
       />
@@ -151,13 +164,15 @@ export class SelectedCommit extends React.Component<
         files={this.props.changedFiles}
         emoji={this.props.emoji}
         repository={this.props.repository}
-        gitHubUsers={this.props.gitHubUsers}
         onExpandChanged={this.onExpandChanged}
         isExpanded={this.state.isExpanded}
         onDescriptionBottomChanged={this.onDescriptionBottomChanged}
         hideDescriptionBorder={this.state.hideDescriptionBorder}
         hideWhitespaceInDiff={this.props.hideWhitespaceInDiff}
+        showSideBySideDiff={this.props.showSideBySideDiff}
         onHideWhitespaceInDiffChanged={this.onHideWhitespaceInDiffChanged}
+        onShowSideBySideDiffChanged={this.onShowSideBySideDiffChanged}
+        onDiffOptionsOpened={this.props.onDiffOptionsOpened}
       />
     )
   }
@@ -175,12 +190,18 @@ export class SelectedCommit extends React.Component<
     }
   }
 
-  private onHideWhitespaceInDiffChanged = (hideWhitespaceInDiff: boolean) => {
-    this.props.dispatcher.onHideWhitespaceInDiffChanged(
+  private onHideWhitespaceInDiffChanged = async (
+    hideWhitespaceInDiff: boolean
+  ) => {
+    await this.props.dispatcher.onHideWhitespaceInDiffChanged(
       hideWhitespaceInDiff,
       this.props.repository,
       this.props.selectedFile as CommittedFileChange
     )
+  }
+
+  private onShowSideBySideDiffChanged = (showSideBySideDiff: boolean) => {
+    this.props.dispatcher.onShowSideBySideDiffChanged(showSideBySideDiff)
   }
 
   private onCommitSummaryReset = () => {
@@ -213,6 +234,7 @@ export class SelectedCommit extends React.Component<
 
   /**
    * Open file with default application.
+   *
    * @param path The path of the file relative to the root of the repository
    */
   private onOpenItem = (path: string) => {
@@ -222,6 +244,10 @@ export class SelectedCommit extends React.Component<
 
   public render() {
     const commit = this.props.selectedCommit
+
+    if (this.props.areMultipleCommitsSelected) {
+      return this.renderMultipleCommitsSelected()
+    }
 
     if (commit == null) {
       return <NoCommitSelected />
@@ -242,19 +268,51 @@ export class SelectedCommit extends React.Component<
           </Resizable>
           {this.renderDiff()}
         </div>
+        {this.renderDragOverlay()}
       </div>
     )
   }
 
-  private onContextMenu = async (event: React.MouseEvent<HTMLDivElement>) => {
-    event.preventDefault()
-
-    if (this.props.selectedFile == null) {
-      return
+  private renderDragOverlay(): JSX.Element | null {
+    if (!this.props.showDragOverlay) {
+      return null
     }
 
-    const filePath = this.props.selectedFile.path
-    const fullPath = Path.join(this.props.repository.path, filePath)
+    return <DragOverlay dragZoneDescription="branch-button" />
+  }
+
+  private renderMultipleCommitsSelected(): JSX.Element {
+    const BlankSlateImage = encodePathAsUrl(
+      __dirname,
+      'static/empty-no-commit.svg'
+    )
+
+    return (
+      <div id="multiple-commits-selected" className="blankslate">
+        <div className="panel blankslate">
+          <img src={BlankSlateImage} className="blankslate-image" />
+          <div>
+            <p>Unable to display diff when multiple commits are selected.</p>
+            <div>You can:</div>
+            <ul>
+              <li>Select a single commit to view a diff.</li>
+              <li>Drag the commits to the branch menu to cherry-pick them.</li>
+              <li>Right click on multiple commits to see options.</li>
+            </ul>
+          </div>
+        </div>
+        {this.renderDragOverlay()}
+      </div>
+    )
+  }
+
+  private onContextMenu = async (
+    file: CommittedFileChange,
+    event: React.MouseEvent<HTMLDivElement>
+  ) => {
+    event.preventDefault()
+
+    const fullPath = Path.join(this.props.repository.path, file.path)
     const fileExistsOnDisk = await pathExists(fullPath)
     if (!fileExistsOnDisk) {
       showContextualMenu([
@@ -268,7 +326,7 @@ export class SelectedCommit extends React.Component<
       return
     }
 
-    const extension = Path.extname(filePath)
+    const extension = Path.extname(file.path)
 
     const isSafeExtension = isSafeFileExtension(extension)
     const openInExternalEditor = this.props.externalEditorLabel
@@ -282,7 +340,7 @@ export class SelectedCommit extends React.Component<
       },
       {
         label: RevealInFileManagerLabel,
-        action: () => revealInFileManager(this.props.repository, filePath),
+        action: () => revealInFileManager(this.props.repository, file.path),
         enabled: fileExistsOnDisk,
       },
       {
@@ -292,7 +350,7 @@ export class SelectedCommit extends React.Component<
       },
       {
         label: OpenWithDefaultProgramLabel,
-        action: () => this.onOpenItem(filePath),
+        action: () => this.onOpenItem(file.path),
         enabled: isSafeExtension && fileExistsOnDisk,
       },
     ]

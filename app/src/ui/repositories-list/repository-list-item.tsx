@@ -42,7 +42,7 @@ interface IRepositoryListItemProps {
   /** The characters in the repository name to highlight */
   readonly matches: IMatches
 
-  /** Number of commits this local repo branch is behind or ahead of its remote brance */
+  /** Number of commits this local repo branch is behind or ahead of its remote branch */
   readonly aheadBehind: IAheadBehind | null
 
   /** Number of uncommitted changes */
@@ -191,8 +191,8 @@ const renderAheadBehindIndicator = (aheadBehind: IAheadBehind) => {
 
   return (
     <div className="ahead-behind" title={aheadBehindTooltip}>
-      {ahead > 0 && <Octicon symbol={OcticonSymbol.arrowSmallUp} />}
-      {behind > 0 && <Octicon symbol={OcticonSymbol.arrowSmallDown} />}
+      {ahead > 0 && <Octicon symbol={OcticonSymbol.arrowUp} />}
+      {behind > 0 && <Octicon symbol={OcticonSymbol.arrowDown} />}
     </div>
   )
 }
@@ -203,7 +203,7 @@ const renderChangesIndicator = () => {
       className="change-indicator-wrapper"
       title="There are uncommitted changes in this repository"
     >
-      <Octicon symbol={OcticonSymbol.primitiveDot} />
+      <Octicon symbol={OcticonSymbol.dotFill} />
     </div>
   )
 }
